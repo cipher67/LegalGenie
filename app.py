@@ -1,107 +1,39 @@
 import streamlit as st
-from openai import OpenAI
-import google.generativeai as genai
-import dotenv
-import os
 from PIL import Image
 from audio_recorder_streamlit import audio_recorder
 import base64
 from io import BytesIO
 import random
+import os
+from backend import process_question
+from openai import OpenAI
 
-dotenv.load_dotenv()
+# Initialize OpenAI client
+openai_api_key = os.getenv("OPEN_API_KEY")
+client = OpenAI(api_key=openai_api_key)
 
-def messages_to_gemini(messages):
-    gemini_messages = []
-    prev_role = None
-    for message in messages:
-        if prev_role and (prev_role == message["role"]):
-            gemini_message = gemini_messages[-1]
-        else:
-            gemini_message = {
-                "role": "model" if message["role"] == "assistant" else "user",
-                "parts": [],
-            }
-
-        for content in message["content"]:
-            if content["type"] == "text":
-                gemini_message["parts"].append(content["text"])
-            elif content["type"] == "image_url":
-                gemini_message["parts"].append(base64_to_image(content["image_url"]["url"]))
-            elif content["type"] == "video_file":
-                gemini_message["parts"].append(genai.upload_file(content["video_file"]))
-            elif content["type"] == "audio_file":
-                gemini_message["parts"].append(genai.upload_file(content["audio_file"]))
-
-        if prev_role != message["role"]:
-            gemini_messages.append(gemini_message)
-
-        prev_role = message["role"]
-
-    return gemini_messages
-
-# Function to query and stream the response from the LLM
-def stream_llm_response(model_params, model_type="openai", api_key=None):
-    response_message = ""
-
-    if model_type == "openai":
-        client = OpenAI(api_key=api_key)
-        for chunk in client.chat.completions.create(
-            model=model_params["model"] if "model" in model_params else "gpt-4o",
-            messages=st.session_state.messages,
-            temperature=model_params["temperature"] if "temperature" in model_params else 0.3,
-            max_tokens=4096,
-            stream=True,
-        ):
-            chunk_text = chunk.choices[0].delta.content or ""
-            response_message += chunk_text
-            yield chunk_text
-
-    elif model_type == "google":
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            model_name = model_params["model"],
-            generation_config={
-                "temperature": model_params["temperature"] if "temperature" in model_params else 0.3,
-            }
-        )
-        gemini_messages = messages_to_gemini(st.session_state.messages)
-        print("st_messages:", st.session_state.messages)
-        print("gemini_messages:", gemini_messages)
-        for chunk in model.generate_content(gemini_messages):
-            chunk_text = chunk.text or ""
-            response_message += chunk_text
-            yield chunk_text
-
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": [
-            {
-                "type": "text",
-                "text": response_message,
-            }
-        ]})
-
-
-# Function to convert file to base64
 def get_image_base64(image_raw):
     buffered = BytesIO()
     image_raw.save(buffered, format=image_raw.format)
     img_byte = buffered.getvalue()
-
     return base64.b64encode(img_byte).decode('utf-8')
-
 
 def file_to_base64(file):
     with open(file, "rb") as f:
         return base64.b64encode(f.read())
 
-
 def base64_to_image(base64_string):
     base64_string = base64_string.split(",")[1]
-
     return Image.open(BytesIO(base64.b64decode(base64_string)))
 
+def stt_transcribe(audio_file):
+    """Function to transcribe audio to text using OpenAI's Whisper model."""
+    with open(audio_file, "rb") as audio:
+        transcript = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=("audio.wav", audio),
+        )
+        return transcript.text
 
 def main():
     # --- Page Config ---
@@ -114,12 +46,6 @@ def main():
 
     # --- Header ---
     st.html("""<h1 style="text-align: center; color: #6ca395;">🤖 <i>LegalGenie</i> 💬</h1>""")
-
-    # --- Main Content ---
-    openai_api_key = os.getenv("OPEN_API_KEY")
-    google_api_key = os.getenv("GOOGLE_API_KEY")
-
-    client = OpenAI(api_key=openai_api_key)
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -138,75 +64,63 @@ def main():
                     st.audio(content["audio_file"])
 
     with st.sidebar:
-
-        model_params = {
-            "model": os.getenv("MODEL"),
-            "temperature": 0.3,
-        }
-
-        model = os.getenv("MODEL")
-        model_type = os.getenv("MODEL_TYPE")
-
         # Image Upload
-        if model in ["gpt-4o", "gpt-4-turbo", "gemini-1.5-flash", "gemini-1.5-pro"]:
-            st.write(f"### **🖼️ Add an image{' or a video file' if model_type == 'google' else ''}:**")
+        st.write(f"### **🖼️ Add an image or a video file:**")
 
-            def add_image_to_messages():
-                if st.session_state.uploaded_img or (
-                        "camera_img" in st.session_state and st.session_state.camera_img):
-                    img_type = st.session_state.uploaded_img.type if st.session_state.uploaded_img else "image/jpeg"
-                    if img_type == "video/mp4":
-                        # save the video file
-                        video_id = random.randint(100000, 999999)
-                        with open(f"video_{video_id}.mp4", "wb") as f:
-                            f.write(st.session_state.uploaded_img.read())
-                        st.session_state.messages.append(
-                            {
-                                "role": "user",
-                                "content": [{
-                                    "type": "video_file",
-                                    "video_file": f"video_{video_id}.mp4",
-                                }]
-                            }
-                        )
-                    else:
-                        raw_img = Image.open(st.session_state.uploaded_img or st.session_state.camera_img)
-                        img = get_image_base64(raw_img)
-                        st.session_state.messages.append(
-                            {
-                                "role": "user",
-                                "content": [{
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:{img_type};base64,{img}"}
-                                }]
-                            }
-                        )
+        def add_image_to_messages():
+            if st.session_state.uploaded_img or ("camera_img" in st.session_state and st.session_state.camera_img):
+                img_type = st.session_state.uploaded_img.type if st.session_state.uploaded_img else "image/jpeg"
+                if img_type == "video/mp4":
+                    video_id = random.randint(100000, 999999)
+                    with open(f"video_{video_id}.mp4", "wb") as f:
+                        f.write(st.session_state.uploaded_img.read())
+                    st.session_state.messages.append(
+                        {
+                            "role": "user",
+                            "content": [{
+                                "type": "video_file",
+                                "video_file": f"video_{video_id}.mp4",
+                            }]
+                        }
+                    )
+                else:
+                    raw_img = Image.open(st.session_state.uploaded_img or st.session_state.camera_img)
+                    img = get_image_base64(raw_img)
+                    st.session_state.messages.append(
+                        {
+                            "role": "user",
+                            "content": [{
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{img_type};base64,{img}"}
+                            }]
+                        }
+                    )
 
-            cols_img = st.columns(2)
+        cols_img = st.columns(2)
 
-            with cols_img[0]:
-                with st.popover("📁 Upload"):
-                    st.file_uploader(
-                        f"Upload an image{' or a video' if model_type == 'google' else ''}:",
-                        type=["png", "jpg", "jpeg"] + (["mp4"] if model_type == "google" else []),
-                        accept_multiple_files=False,
-                        key="uploaded_img",
+        with cols_img[0]:
+            with st.popover("📁 Upload"):
+                st.file_uploader(
+                    "Upload an image or a video:",
+                    type=["png", "jpg", "jpeg", "mp4"],
+                    accept_multiple_files=False,
+                    key="uploaded_img",
+                    on_change=add_image_to_messages,
+                )
+
+        with cols_img[1]:
+            with st.popover("📸 Camera"):
+                activate_camera = st.checkbox("Activate camera (only images)")
+                if activate_camera:
+                    st.camera_input(
+                        "Take a picture",
+                        key="camera_img",
                         on_change=add_image_to_messages,
                     )
 
-            with cols_img[1]:
-                with st.popover("📸 Camera"):
-                    activate_camera = st.checkbox("Activate camera (only images)")
-                    if activate_camera:
-                        st.camera_input(
-                            "Take a picture",
-                            key="camera_img",
-                            on_change=add_image_to_messages,
-                        )
-
         # Audio Upload
         st.write("#")
-        st.write(f"### **🎤 Add an audio{' (Speech To Text)' if model_type == 'openai' else ''}:**")
+        st.write(f"### **🎤 Add an audio (Speech To Text):**")
 
         audio_prompt = None
         audio_file_added = False
@@ -216,31 +130,26 @@ def main():
         speech_input = audio_recorder("Press to talk:", icon_size="3x", neutral_color="#6ca395", )
         if speech_input and st.session_state.prev_speech_hash != hash(speech_input):
             st.session_state.prev_speech_hash = hash(speech_input)
-            if model_type == "openai":
-                transcript = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=("audio.wav", speech_input),
-                )
+            # Save the audio file
+            audio_id = random.randint(100000, 999999)
+            audio_file = f"audio_{audio_id}.wav"
+            with open(audio_file, "wb") as f:
+                f.write(speech_input)
 
-                audio_prompt = transcript.text
+            # Transcribe the audio file
+            audio_prompt = stt_transcribe(audio_file)
 
-            elif model_type == "google":
-                # save the audio file
-                audio_id = random.randint(100000, 999999)
-                with open(f"audio_{audio_id}.wav", "wb") as f:
-                    f.write(speech_input)
+            st.session_state.messages.append(
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "audio_file",
+                        "audio_file": audio_file,
+                    }]
+                }
+            )
+            audio_file_added = True
 
-                st.session_state.messages.append(
-                    {
-                        "role": "user",
-                        "content": [{
-                            "type": "audio_file",
-                            "audio_file": f"audio_{audio_id}.wav",
-                        }]
-                    }
-                )
-
-                audio_file_added = True
         st.divider()
         def reset_conversation():
             if "messages" in st.session_state and len(st.session_state.messages) > 0:
@@ -251,38 +160,43 @@ def main():
             on_click=reset_conversation,
         )
 
+    # Chat input
+    prompt = st.chat_input("Hi! Ask me anything...")
 
+    if prompt or audio_prompt:
+        user_input = prompt or audio_prompt
 
-     # Chat input
-    if prompt := st.chat_input("Hi! Ask me anything...") or audio_prompt or audio_file_added:
-        if not audio_file_added:
-            st.session_state.messages.append(
-                {
-                    "role": "user",
-                    "content": [{
-                        "type": "text",
-                        "text": prompt or audio_prompt,
-                    }]
-                }
-            )
+        st.session_state.messages.append(
+            {
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": user_input,
+                }]
+            }
+        )
 
-            # Display the new messages
-            with st.chat_message("user"):
-                st.markdown(prompt)
+        # Display the new messages
+        with st.chat_message("user"):
+            st.markdown(user_input)
 
-        else:
-            # Display the audio file
-            with st.chat_message("user"):
-                st.audio(f"audio_{audio_id}.wav")
+        # Send the question to the backend and get the response
+        response = process_question(user_input)
 
+        # Display the response
         with st.chat_message("assistant"):
-            st.write_stream(
-                stream_llm_response(
-                    model_params=model_params,
-                    model_type=model_type,
-                    api_key=openai_api_key if model_type == "openai" else google_api_key)
-            )
+            st.write(response)
 
+        # Add the response to the conversation history
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "text",
+                    "text": response,
+                }]
+            }
+        )
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
